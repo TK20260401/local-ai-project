@@ -1,488 +1,163 @@
-"""
-==================================== プロ野球公式記録員 AI ====================================
-
-【機能①：システムプロンプトによる出力制御】完全実装
-  └─ ペルソナ＝「日本野球機構（NPB）の公式記録員」固定
-    └─ 「提供されたデータにない球団名はハルシネーション防止のため回答しない」制約組み込み
-
-【機能②：フォルダ内のテキストファイルを自動スキャンする簡易 RAG】完全実装
-  └─ フォルダ (.txt ファイル) を自動的に全スキャンして知識データベース化（カンニングペーパー）
-    └─ 質問時に自動的にその内容を AI に読み込ませる仕組み（ファイル名指定不要・自動結合）
-
-使用方法: このプロジェクトフォルダに .txt ファイルを置くだけで、AI は自動的に全てを読み込みます。
-注意：未登録の球団名については「情報はありません」と回答します。
-==================================== プロ野球公式記録員 AI ====================================
-
-
-"""
-
-import tkinter as tk
-from tkinter import scrolledtext, messagebox
-import requests
+import glob
 import json
 import threading
-import os
+import tkinter as tk
+from tkinter import scrolledtext
 
+import requests
 
+# ==============================================================================
+# ⚾ プロ野球公式記録員 AI (完成形)
+# ==============================================================================
 
-# === 定数設定（安全な localhost を使用）===
-
-MODEL_NAME = "qwen2.5vl:7b"            # モデル名：Qwen2.5VL 7B (軽量高速版)
-OLLAMA_URL = "http://localhost:11434/api/chat"   # ローカル Ollama API
+# 【M4 Pro 爆速仕様】完全オフライン用のローカルモデルとアドレス
+MODEL_NAME = "qwen3.5-9b-16k:latest"
+OLLAMA_URL = "http://localhost:11434/api/chat"
 
 
 class LocalAIChatApp:
-    """プロ野球公式記録員 AI - システムプロンプト制御 × フォルダ全スキャン RAG 統合エディション"""
-
     def __init__(self, root):
+        # UI と状態管理の初期化
         self.root = root
+        self.root.title("プロ野球公式記録員 AI")
+        self.root.geometry("600x700")
 
-# ウィンドウのタイトルとサイズ設定
-        self.root.title("🏟️ プロ野球公式記録員 AI")
-        self.root.geometry("720x850")
+        # 会話の履歴を保存するリスト
+        self.conversation_history = []
 
-
-        # === 状態変数定義（会話履歴 & RAG データベース）===
-        self.conversation_history = []    # Ollama API に渡すメッセージのリスト
-        self.knowledge_base_files = {}    # スキャンされた .txt ファイル {file_key: {"content": ...}}
-
-
-# === UI ビルド（上から順に配置）===
-
-# タイトルエリア
-        title_label = tk.Label(
-            root, text="🏟️ プロ野球公式記録員 AI", font=("Helvetica", 16), fg="#2E7D32")
-        title_label.pack(pady=(0,8))
-
-
-# サブタイトル（制約表示）
-        subtitle = tk.Label(root,
-                            text="【未登録球団はハルシネーション防止のため回答しません】",
-                            font=("Helvetica", 10), fg="#d32f2f")
-        subtitle.pack()
-
-
-
-    # チャットエリア（メイン出力画面）
-        self.chat_area = scrolledtext.ScrolledText(root, wrap=tk.WORD,
-                                                   font=("Helvetica", 12))
-        self.chat_area.pack(padx=8, pady=(5,8), fill=tk.BOTH, expand=True)
-
-
-
-    # ステータスバー（ファイル登録情報など）
-        status_frame = tk.Frame(root, bg="#f0f0f2")
-        status_frame.pack(fill=tk.X, padx=10, pady=(0, 7))
-
-
-        self.status_label = tk.Label(
-            status_frame, text="📂 RAG データベース：スキャン中...",
-            font=("Helvetica", 9), bg="#f0f0f2", fg="#666")
-        self.status_label.pack(fill=tk.X)
-
-
-
-    # ボタンエリア（入力欄 & サブ機能）
-
-        input_frame = tk.Frame(root, bg="white")
-        input_frame.pack(padx=10, pady=(5, 7), fill=tk.X)
-
-
-# メインのメッセージ入力欄
-        self.entry_box = tk.Entry(
-            input_frame, font=("Helvetica", 13), width=62
+        # チャット表示エリア
+        self.chat_area = scrolledtext.ScrolledText(
+            root, wrap=tk.WORD, font=("Helvetica", 12)
         )
-        self.entry_box.pack(side=tk.LEFT, expand=True, padx=(0,8))
+        self.chat_area.pack(padx=10, pady=10, fill=tk.BOTH, expand=True)
+        self.chat_area.config(state=tk.DISABLED)
 
+        # 入力フレーム
+        input_frame = tk.Frame(root)
+        input_frame.pack(padx=10, pady=10, fill=tk.X)
 
+        # テキスト入力欄
+        self.entry_box = tk.Entry(input_frame, font=("Helvetica", 14))
+        self.entry_box.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 10))
+        self.entry_box.bind("<Return>", lambda event: self.send_message())
 
-    # 送信ボタン（緑）
-        send_btn = tk.Button(
-            input_frame, text="送信 →", command=self.send_message,
-            bg="#4CAF50", fg="white", font=("Helvetica", 11), px=25)
-        send_btn.pack(side=tk.RIGHT, padx=(8,0))
-
-
-# RAG データベース更新ボタン（オレンジ）
-        scan_frame = tk.Frame(root)
-        scan_frame.pack(fill=tk.X, padx=10, pady=(4,3))
-
-
-        self.scan_button = tk.Button(
-            scan_frame, text="🔄 データベースを更新", command=self.rescan_knowledge_base,
-            bg="#FF9800", fg="white", font=("Helvetica", 10)
+        # 送信ボタン
+        self.send_button = tk.Button(
+            input_frame,
+            text="送信",
+            command=self.send_message,
+            bg="#009688",
+            fg="white",
+            font=("Helvetica", 12, "bold"),
         )
-        self.scan_button.pack(fill=tk.X)
+        self.send_button.pack(side=tk.RIGHT)
 
+        self.append_to_chat(
+            "System",
+            f"【自動全スキャンRAG起動: {MODEL_NAME}】\nフォルダ内のすべての .txt ファイルを自動結合して読み込みます。\n"
+            + "-" * 50,
+        )
 
+    def append_to_chat(self, sender, message):
+        self.chat_area.config(state=tk.NORMAL)
+        self.chat_area.insert(tk.END, f"\n[{sender}]: {message}\n")
+        self.chat_area.see(tk.END)
+        self.chat_area.config(state=tk.DISABLED)
 
-    # ヘルプテキスト（説明）
-        help_text = tk.Label(root,
-                             text="(フォルダ内の .txt ファイルを自動スキャンします)",
-                             font=("Helvetica", 8), fg="#9e9e9e")
-        help_text.pack()
+    def load_all_txt_files(self):
+        """【機能②】フォルダ内のすべての .txt ファイルを自動スキャンして結合"""
+        combined_knowledge = ""
+        txt_files = glob.glob("*.txt")
 
+        for file_path in txt_files:
+            try:
+                with open(file_path, "r", encoding="utf-8") as f:
+                    content = f.read()
+                    combined_knowledge += (
+                        f"\n--- ファイル名: {file_path} ---\n{content}\n"
+                    )
+            except Exception as e:
+                print(f"読み込み失敗 ({file_path}): {e}")
 
+        return combined_knowledge
 
-# システム起動メッセージ
-        self.append_to_chat("System", "🏟️ プロ野球記録員 AI が起動しました\n─────────\n")
+    def send_message(self):
+        user_text = self.entry_box.get().strip()
+        if not user_text:
+            return
 
+        self.append_to_chat("You", user_text)
+        self.entry_box.delete(0, tk.END)
 
-    def append_to_chat(self, sender: str, message: str):
-       """チャットエリアにテキストを追加するメソッド"""
+        # 1. フォルダ内のテキスト知識を自動全スキャンしてロード
+        knowledge_base = self.load_all_txt_files()
 
-  self.chat_area.config(state=tk.NORMAL)   # UI を編集可能モードにする
+        # 2. 【機能①】システムプロンプトによる絶対的制約（ペルソナ固定とハルシネーション防止）
+        system_instruction = (
+            "あなたは『プロ野球公式記録員』です。以下の【提供された外部データ】に記載されている事実のみを基準に、ユーザーの質問に日本語で正確に答えてください。\n"
+            "データに記載がない球団名や情報については、ハルシネーション（嘘）を防ぐために、知ったかぶりをせず必ず『提供されたデータに情報がありません』と正直に回答してください。絶対に嘘を合成してはいけません。\n\n"
+            f"【提供された外部データ】\n{knowledge_base}\n"
+        )
 
+        # 毎回最新のテキスト状態をシステムプロンプトとして上書き更新（文脈パニックの防止）
+        self.conversation_history = [{"role": "system", "content": system_instruction}]
 
-# メッセージを挿入（改行はそのまま）
-        insert_pos = len(message.splitlines(keepends=True))
-        self.chat_area.insert(tk.END, f"\n[{sender}]: {message}")
+        # ユーザーの発言を履歴に追加
+        self.conversation_history.append({"role": "user", "content": user_text})
 
+        # 送信ボタンを無効化してバックグラウンドでAIの回答を待つ
+        self.send_button.config(state=tk.DISABLED)
+        threading.Thread(target=self.fetch_ai_response_stream, daemon=True).start()
 
-    スクロールを下へ移動する
+    def fetch_ai_response_stream(self):
         try:
-            self.chat_area.see(tk.END)
-
-        finally:
-           self.chat_area.config(state=tk.DISABLED)   # 読み取り専用に戻る
-
-
-def rescan_knowledge_base(self):
-     """フォルダ内の全 .txt ファイルを自動スキャンして RAG データベースを更新"""
-
-    エラーキャッチブロック
-      try:
-       project_root = os.path.dirname(os.path.abspath(__file__))
-
-            if not os.path.isdir(project_root):
-              self.status_label.config(text="⚠️ 無効なデータフォルダです")
-                 return
-
-# === 全 .txt ファイルを自動でスキャンして知識データベースに格納（カンニングペーパー化）===
-       for filename in sorted(os.listdir(project_root)):
-             if not filename.endswith(".txt"): continue     # .txt のみ対象
-
-        filepath = os.path.join(project_root, filename)
-
-
-    try:
-      with open(filepath, "r", encoding="utf-8") as f:  テキストファイルを開く
-               content = f.read()
-
-       file_key = filename[:-4] if len(filename)>5 else filename   # ファイル名の識別子（拡張子を除外）
-
-
-      self.knowledge_base_files[file_key] = {"content": content}
-
-# ✅ データベース構築完了メッセージを表示（システムロールが未送信中ならスキップ）
-
-        file_count = len(self.knowledge_base_files)
-
-    status_list_display = "\n".join( [f"[📄 {name}]" for name,_ in self.knowledge_base_files.items()] )
-
-       finally:
-         if not isinstance(file_count, int):
-             pass
-
-except Exception as e:
-
-        print(f"[ファイルスキャン例外処理]: {type(e).__name__}: {str(e)}")
-
-# ステータスバーを更新して完了を表示（エラーも記録）
-  self.status_label.config(text=f"✅ スキャン完了：{file_count} ファイル (登録済み)")
-
-
-    def build_system_prompt_and_rag(self, user_question: str) -> dict:
-        """システムプロンプト＆RAG コンテキストを構築し、会話履歴に追加する。
-
-      @arg  user_question : ユーザーの質問文字列
-@returns  {"role": "system", "content": "<組み立てられた完全なプロンプト>"}
-
-
-       =============================================
-          【①】システムプロンプト：ペルソナと制約を組み込む（厳格）
-     1. 「日本野球機構 (NPB) の公式記録員」としての固定役割を設定
-        └─ 推測や創作、ハルシネーションは一切行わない
-
-      2. ハルシネーション防止の絶対制約を適用
-         └─ 【提供されたデータにない球団名は「その情報はありません」】
-
-
-       =============================================
-          【②】RAG コンテキスト：全.txt ファイル内容を結合（カンニングペーパー化）
-     1. knowledge_base_files から全ての .txt の文章を順に取り出し
-        └─ 「📄[ファイル名]」で区切り、AI に自動的に読み込ませる
-      2. フォルダ内の全.txt ファイルを自動スキャンし（機能②実装）
-         └─ ファイル名指定不要・結合済みプロンプトとして API に渡す
-
-
-       """
-
-        # === システムプロンプト構築パート（制約を組み込む：ペルソナ固定 & ハルシネーション防止）===
-
-   system_prompt_parts = [
-
-"""【システムプロンプト：絶対的な役割と制約】\n" +
-
-  "━━━━━━━━━━━━━━━"\n
-
-
- "**あなたのプロフィール**:\n""")
-
-
-# プロ野球記録員としての固定ペルソナ（推測禁止・ハルシネーション防止）
-system_prompt_parts.append(" - あなたは「日本野球機構 (NPB) の公式記録員」です\n" +
-                          " - 正確で信頼性の高いデータを扱います\n" +
-                           "- 推測や創作、ハルシネーションは一切行いません\n\n")
-
-
-
-# ハルシネーション防止の絶対制約を組み込む（最重要！）
-system_prompt_parts.append("""【絶対的な制約】:\n
-+ "**提供された外部データに記載がない球団名について質問された場合は**,\n" +
-   "**「その情報はありません」と必ず回答しなさい。**\n\n""")
-
-
-
-# === RAG コンテキスト構築パート（全.txt ファイル内容を結合：カンニングペーパー化）===
-
-rag_context_parts = []
-
-      for file_key in sorted(self.knowledge_base_files.keys()):
-       if not self.conversation_history:  # システムロールのみ時はスキップ
-           continue
-
-            content_with_path = f"📄[{file_key}]\n{self.knowledge_base[file_key]['content']}"\n
-
-    rag_context_parts.append(content_with_path)
-
-
-if not rag_context_parts:     # 知識データベースが空の場合は制約を強調
-      return {
-         "role": "system",
-
-
-     """【システムプロンプト：厳格な制約】\n" +
-         "**「提供されたデータにない球団名は回答しません**」「\n""")
-
-
-# 登録されているファイルの内容をすべて RAG コンテキストに統合
-full_context = "\n━━━━".join(rag_context_parts)
-
-return {
-    "role": "system",
-
-
-     f"""【システムプロンプト：絶対的な制約】\n" +
-         "{"".join(system_prompt_parts)}\n\n""")  # システムプロンプトを連結
-
-
-
-# === ハルシネーション防止の絶対制約を組み込む（重要！）===
-
-system_prompt_text += """【絶対的な制約】:\n
-+ "**提供された外部データに記載がない球団名について質問された場合は**,\n" +
-   "**「その情報はありません」と必ず回答しなさい。**\n\n""")
-
-
-# === 実際の会話履歴に追加（ユーザーの質問を末尾）===
-
-conversation_history.append({"role": "user",
-
-content": user_question}
-
-
-    # --- RAG コンテキストを組み込んだ完全プロンプトを作成 ---
-
-rag_prompt = "".join(system_prompt_parts) + full_context + "\n"
-
-   if not rag_prompt: return {"error": "システムプロンプト構築失敗"}
-
-# === 会話履歴の末尾にシステムロールを追加（Ollama API に渡す形式）===
-
-self.conversation_history.append({"role":
-
-Assistant","content":rag_prompt})
-
-
-    # --- AI レスポンス送信準備状態にする---
-
-return {"prompt": rag_prompt, "conversation_history"}
-
-
-def send_message(self):
-     """ユーザー入力を受け取り、AI に送信してレスポンスを表示"""
-
-
-
-user_text = self.entry_box.get().strip()   入力文字列を取得（空白を除去）
-
-
-if not user_text: return           # インタール文字のみなら何もしない
-
-
-    # UI 更新：ユーザーの質問表示
-
-question_display = f"> {user_text}\n" + "─"*38
-
-
-self.append_to_chat("You", question_display)     チャットエリアに追加してスクロール下へ移動
-
-
-self.entry_box.delete(0, tk.END)   入力欄をクリア
-
-
-        # === システムプロンプト & RAG コンテキストを組み立て（機能①＋機能②：両方実装）===
-
-      self.build_system_prompt_and_rag(user_text)
-
-            system_prompt_parts = []\n
-
-      for file_info in rag_context_parts:  スキャンしたファイルデータを順に追加
-
- section_header = f"\n📄[{file_info['name']}] (Knowledge Base)\n─"*38
-
- content_content
-
-.join([" " * 4 + line] if any(c.isdigit() for c in ["1","2"]) else [])
-
-    system_prompt_parts.extend([section_header, file_info["data"]])
-
-
-        # システムプロンプトを結合・出力する（ハルシネーション防止の制約を含む）\n
-
-
-final_rag_context = "".join(system_prompt_parts)
-
-
-rag_system_message = """【システムプロンプト：絶対的な制約】\n" +
-                       f"{full_context}\n\n""")
-
-    # === AI レスポンス送信（バックグラウンドスレッドで）===
-
-self.conversation_history.append({"role": "user",
-
-content": user_text})
-
-
-# ボタンを無効化して待機状態へ
-
-        self.scan_button.config(state=tk.DISABLED)
-
-
-        threading.Thread(
-            target=self.fetch_ai_response_stream, \n
-
-          daemon=True).start()    # 非デモンドスレッドで背景処理を実行
-
-
-             def fetch_ai_response_stream(self):
-              try:
-                 payload = {
-
-"model": MODEL_NAME,\
-
+            payload = {
+                "model": MODEL_NAME,
                 "messages": self.conversation_history,
+                "stream": True,
+                "options": {
+                    "num_ctx": 2048  # 【熟考対策】記憶長を絞り込み、最初のタメを短縮
+                },
+            }
 
-                 "stream": True,\n
+            response = requests.post(OLLAMA_URL, json=payload, stream=True)
 
-                  options": {\n
+            if response.status_code == 200:
+                self.root.after(0, lambda: self.chat_area.config(state=tk.NORMAL))
+                self.root.after(0, lambda: self.chat_area.insert(tk.END, "\n[AI]: "))
 
-                    "num_ctx": 2048   # コンテキストサイズを制限（性能最適化）\n
+                full_response = ""
+                for line in response.iter_lines():
+                    if line:
+                        chunk = json.loads(line.decode("utf-8"))
+                        content = chunk.get("message", {}).get("content", "")
+                        full_response += content
+                        self.root.after(
+                            0, lambda c=content: self.chat_area.insert(tk.END, c)
+                        )
+                        self.root.after(0, lambda: self.chat_area.see(tk.END))
 
-               }
-              \n
-
-
-         response = requests.post(OLLAMA_URL,json=payload)
-
-
-                if response.status_code == 200:
-
-                   self.root.after(0, lambda:self.chat_area.config(state=tk.NORMAL))
-
-
-                     full_response=""
-
-
-                        for line in response.iter_lines():\n
-
-                         chunk_line = json.loads(line.decode("utf-8"))
-
-                          if not content := chunk.get("message",{}).get("content",""): pass
-
-                      self.root.after(0,lambda c: self.chat_area.insert(tk.END,c))
-
-            full_response += content\n
-
-                   except UnicodeDecodeError as e:\n
-
-                    error_text = f"[Unicode エラー]: {str(e)}"\n
-
-                 finally:
-
-                     # UI 更新：完了メッセージ表示
-
-             if isinstance(chunk, str): pass
-
-
-          self.root.after(0, lambda:self.chat_area.config(state=tk.DISABLED))\n
+                self.conversation_history.append(
+                    {"role": "assistant", "content": full_response}
+                )
+                self.root.after(0, lambda: self.chat_area.insert(tk.END, "\n"))
+                self.root.after(0, lambda: self.chat_area.config(state=tk.DISABLED))
+            else:
+                status = response.status_code
+                self.root.after(
+                    0, lambda: self.append_to_chat("System", f"エラー: {status}")
+                )
+        except Exception as err:
+            error_msg = str(err)
+            self.root.after(
+                0, lambda: self.append_to_chat("System", f"通信失敗: {error_msg}")
+            )
+        finally:
+            self.root.after(0, lambda: self.send_button.config(state=tk.NORMAL))
 
 
-                else:\
-
-                    error_status = response.status_code
-
-                      self.append_to_chat("System", f"API エラー: {error_status}")
-
-               except Exception as err:
-
-                  try:
-
-                        exception_text=str(err)
-
-                          if isinstance(exception_text, str): pass
-
-                 finally:
-
-                     # UI 更新：通信エラー表示
-
-            self.append_to_chat("System", f"【通信失敗】\n{exception}")
-
-       except requests.exceptions.ConnectionError as ce:\n
-
-         connection_error = "Ollama API に接続できません（localhost:11434）"\n
-
-          print(connection_error)\n
-
-      finally:\
-
-        self.scan_button.config(state=tk.NORMAL)
-
-
-    if name == "_main_":\n
-
-     root tk.Tk()
-
-       app LocalAIChatApp(root)\n\n
-
-# 初期化：フォルダ全スキャンで RAG データベース構築（完了後、UI に表示）
-        rescan_knowledge_base(app)
-
-
+if __name__ == "__main__":
+    # UI の起動
+    root = tk.Tk()
+    app = LocalAIChatApp(root)
     root.mainloop()
-
-
-"""
-==================================== プロ野球公式記録員 AI ====================================
-
-
-
-使用方法:
-1. このプロジェクトフォルダに .txt ファイルを置くだけで、AI は自動的に全てを読み込みます。
-2. 「データベース更新」ボタンを押すと最新の内容で再スキャンされます。
-
-注意：質問時には「未登録の球団名については回答しません」という制約が働きます。
-
-
-"""
