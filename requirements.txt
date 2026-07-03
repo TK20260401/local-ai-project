@@ -1,0 +1,10 @@
+streamlit
+ollama
+chromadb
+rank_bm25
+sentence-transformers
+easyocr
+pdf2image
+pypdf
+python-docx
+numpy
